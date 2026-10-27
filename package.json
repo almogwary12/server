@@ -7,18 +7,10 @@
   "type": "commonjs",
   "main": "index.js",
   "scripts": {
-<<<<<<< HEAD
-    "test": "echo \"Error: no test specified\" && exit 1"
-=======
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node index.js"
->>>>>>> 937ec6c (edited server)
   },
   "dependencies": {
     "ws": "^8.22.0"
   }
-<<<<<<< HEAD
 }
-=======
-}
->>>>>>> 937ec6c (edited server)
