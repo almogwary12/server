@@ -1,9 +1,11 @@
-// ═══════════════════════════════════════════════════════════════════
-// Hareeg 14 — Node.js WebSocket server
-// ═══════════════════════════════════════════════════════════════════
+// index.js
+require('dotenv').config({ path: 'atlas-credentials.env' });
 
 const WebSocket = require('ws');
 const { Meld, valueForRank } = require('./meld');
+const db = require('./db');
+const { signToken, verifyToken } = require('./auth');
+console.log(process.env.MONGODB_URI);
 
 const PORT = process.env.PORT || 8080;
 const MAX_HAND_SIZE = 15;
@@ -106,11 +108,11 @@ class Room {
         this.meldsThisTurn = [];
         this.coversThisTurnValue = 0;
 
-        // Snatch tracking
         this.lastDiscardAt = 0;
         this.lastDiscardSeat = -1;
         this.lastDiscardSnatched = false;
-        this.snatchedCards = []; // [{card, discarder, isSnatch, melded} | null]
+        this.snatchedCards = [];
+        this.snatchRetries = [];
 
         this.currentRound = 1;
         this._roundTimer = null;
@@ -233,6 +235,7 @@ class Room {
             lastDiscardAt: this.lastDiscardAt,
             lastDiscardSnatched: this.lastDiscardSnatched,
             snatchedCard: snatchedCard,
+            snatchRetry: this.snatchRetries[seat] === true,
         });
     }
 
@@ -255,6 +258,7 @@ class Room {
         this.hasMeldedArr = Array(n).fill(false);
         this.bannedCovers = Array.from({ length: n }, () => new Set());
         this.snatchedCards = Array(n).fill(null);
+        this.snatchRetries = Array(n).fill(false);
 
         this.currentRound = 1;
         this.currentSeat = this._randomActivePlayer();
@@ -291,6 +295,7 @@ class Room {
         this.lastDiscardSeat = -1;
         this.lastDiscardSnatched = false;
         this.snatchedCards = Array(n).fill(null);
+        this.snatchRetries = Array(n).fill(false);
 
         for (let i = 0; i < n; i++) {
             if (!this.eliminated[i]) {
@@ -307,7 +312,6 @@ class Room {
         if (this.phase !== 'playing') return;
         for (let i = 0; i < this.clients.length; i++) {
             if (!this.eliminated[i] && this.hands[i].length === 0) {
-                // Snatch bonus: apply on win
                 const st = this.snatchedCards[i];
                 if (st && st.isSnatch && st.melded &&
                     st.discarder >= 0 && st.discarder !== i) {
@@ -321,6 +325,7 @@ class Room {
                     }
                 }
                 this.snatchedCards[i] = null;
+                this.snatchRetries[i] = false;
                 this._endRound(false, i);
                 return;
             }
@@ -375,7 +380,7 @@ class Room {
                 roundWinner: winnerIndex, roundWinnerName: winnerName,
                 byDeckEmpty: byDeckEmpty, gameOver: activeCount <= 1,
                 lastDiscardSeat: -1, lastDiscardAt: 0, lastDiscardSnatched: true,
-                snatchedCard: null,
+                snatchedCard: null, snatchRetry: false,
             });
         }
 
@@ -384,6 +389,8 @@ class Room {
             scores: this.scores, eliminated: this.eliminated,
             nextRound: activeCount > 1,
         });
+
+        if (activeCount <= 1) this._persistStats();
 
         this._roundTimer = setTimeout(() => {
             this._roundTimer = null;
@@ -404,17 +411,56 @@ class Room {
                 this.previousScores[i] = this.scores[i];
                 this.foulsThisRound[i] = 0;
                 this.bannedCovers[i] = new Set();
+                this.snatchRetries[i] = false;
             }
             this.currentSeat = nextStarter;
             this._dealNewRound();
         }, 3000);
     }
 
+    _persistStats() {
+        const activeCount = this.eliminated.filter((e) => !e).length;
+        if (activeCount > 1) return;
+        const winnerIdx = this.eliminated.findIndex((e) => !e);
+
+        for (let i = 0; i < this.clients.length; i++) {
+            const c = this.clients[i];
+            if (!c.userId) continue;
+            const won = i === winnerIdx;
+            const xpDelta = won ? 100 : 25;
+            const starDelta = won ? 10 : 2;
+            const coinDelta = won ? 50 : 10;
+
+            db.incrementStats(c.userId, {
+                won, scoreDelta: this.scores[i] || 0,
+                xpDelta, starDelta, coinDelta,
+            })
+                .then(async (u) => {
+                    if (!u) return;
+                    let level = u.level, xp = u.xp, xpMax = u.xpMax;
+                    let leveled = false;
+                    while (xp >= xpMax) {
+                        xp -= xpMax;
+                        level += 1;
+                        xpMax = Math.floor(xpMax * 1.15);
+                        leveled = true;
+                    }
+                    let final = u;
+                    if (leveled) {
+                        final = await db.updateProfile(u._id.toString(), { level, xp, xpMax });
+                    }
+                    if (final && c.ws.readyState === WebSocket.OPEN) {
+                        c.send({ type: 'profile_updated', profile: db.publicProfile(final) });
+                    }
+                })
+                .catch((e) => console.error('[stats] persist failed:', e));
+        }
+    }
+
     handleAction(seat, action, payload) {
         if (this.phase !== 'playing') return this._err(seat, 'Game not running');
         if (this.eliminated[seat]) return this._err(seat, 'You are eliminated');
 
-        // Snatch + cancel_snatch are special — not tied to currentSeat.
         if (action === 'snatch') return this._actSnatch(seat);
         if (action === 'cancel_snatch') return this._actCancelSnatch(seat);
 
@@ -464,6 +510,7 @@ class Room {
 
         this.hands[seat].push(this.deck.pop());
         this.turnPhase = 'discard';
+        this.snatchRetries[seat] = false;
         this._bumpAll();
     }
 
@@ -473,13 +520,14 @@ class Room {
         if (this.hands[seat].length >= MAX_HAND_SIZE)
             return this._err(seat, 'Discard a card first');
         if (!this.discard.length) return this._err(seat, 'Discard pile is empty');
-        if (!this._canPickupDiscard(seat))
+        if (!this.snatchRetries[seat] && !this._canPickupDiscard(seat))
             return this._err(seat, 'Cannot use top of discard');
 
         const card = this.discard.pop();
         this.hands[seat].push(card);
         this.turnPhase = 'discard';
         this.lastDiscardSnatched = true;
+        this.snatchRetries[seat] = false;
         this.snatchedCards[seat] = {
             card: card, discarder: -1, isSnatch: false, melded: false,
         };
@@ -502,9 +550,6 @@ class Room {
         return set.has(cardKey(card));
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // SNATCH — only left neighbor, hand ≥ 2, within 2s
-    // ═══════════════════════════════════════════════════════════════════
     _actSnatch(seat) {
         const n = this.clients.length;
         if (this.turnPhase !== 'draw') return this._err(seat, 'not-draw-phase');
@@ -525,6 +570,7 @@ class Room {
         const card = this.discard.pop();
         this.hands[seat].push(card);
         this.turnPhase = 'discard';
+        this.snatchRetries[seat] = false;
         this.snatchedCards[seat] = {
             card: card, discarder: this.lastDiscardSeat, isSnatch: true, melded: false,
         };
@@ -533,9 +579,6 @@ class Room {
         this._bumpAll();
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // CANCEL SNATCH — return card, back to draw phase, no penalty
-    // ═══════════════════════════════════════════════════════════════════
     _actCancelSnatch(seat) {
         if (this.turnPhase !== 'discard')
             return this._err(seat, 'not-discard-phase');
@@ -543,9 +586,7 @@ class Room {
         const st = this.snatchedCards[seat];
         if (!st) return this._err(seat, 'no-snatch');
         if (st.melded) return this._err(seat, 'already-melded');
-        if (!st.isSnatch) return this._err(seat, 'not-a-snatch');
 
-        // Return the card to the discard pile
         const si = this.hands[seat].findIndex((c) => cardsEqual(c, st.card));
         if (si !== -1) this.hands[seat].splice(si, 1);
         this.discard.push(st.card);
@@ -554,6 +595,7 @@ class Room {
         this.turnPhase = 'draw';
         this.lastDiscardSeat = -1;
         this.lastDiscardSnatched = false;
+        this.snatchRetries[seat] = true;
 
         this._bumpAll();
     }
@@ -565,7 +607,6 @@ class Room {
         const idx = this.hands[seat].findIndex((c) => cardsEqual(c, card));
         if (idx === -1) return this._err(seat, 'Card not in hand');
 
-        // Handle picked card
         if (this.snatchedCards[seat]) {
             const st = this.snatchedCards[seat];
             if (!st.melded) {
@@ -641,6 +682,7 @@ class Room {
         this.lastDiscardAt = Date.now();
         this.lastDiscardSeat = seat;
         this.lastDiscardSnatched = false;
+        this.snatchRetries[seat] = false;
 
         this._checkRoundEnd();
         if (this.phase === 'playing') this._advanceTurn();
@@ -694,9 +736,6 @@ class Room {
         if (onTable) st.melded = true;
     }
 
-    // FIX: removed the unsafe `splice(-1, 1)` path — validate against a
-    // copy of the hand so duplicate jokers (cardsEqual treats all jokers
-    // as equal) can't cause the wrong card to be removed.
     _removeCardsFromHand(seat, cards) {
         const remaining = [...this.hands[seat]];
         for (const c of cards) {
@@ -729,7 +768,6 @@ class Room {
         m.lockValue();
 
         this._checkPickedMelded(seat);
-
         this._checkRoundEnd();
         if (this.phase === 'playing') this._bumpAll();
     }
@@ -750,9 +788,6 @@ class Room {
             validated.push({ m, cards });
         }
 
-        // Validate & remove cards one meld at a time so that overlapping
-        // melds or duplicate jokers are correctly rejected without
-        // silently corrupting the hand.
         for (const { cards } of validated) {
             if (!this._removeCardsFromHand(seat, cards))
                 return this._err(seat, 'Card not in hand');
@@ -766,7 +801,6 @@ class Room {
         }
 
         this._checkPickedMelded(seat);
-
         this._checkRoundEnd();
         if (this.phase === 'playing') this._bumpAll();
     }
@@ -803,7 +837,6 @@ class Room {
         }
 
         this._checkPickedMelded(seat);
-
         this._checkRoundEnd();
         if (this.phase === 'playing') this._bumpAll();
     }
@@ -830,15 +863,14 @@ class Room {
         this.hands[seat].push(joker);
 
         this._checkPickedMelded(seat);
-
         this._bumpAll();
     }
 
     _advanceTurn() {
-        // Clear snatch tracking for player whose turn ended
         if (this.snatchedCards[this.currentSeat]) {
             this.snatchedCards[this.currentSeat] = null;
         }
+        this.snatchRetries[this.currentSeat] = false;
         this.meldsThisTurn = [];
         this.coversThisTurnValue = 0;
 
@@ -924,7 +956,16 @@ class Hub {
 }
 
 class Client {
-    constructor(ws) { this.ws = ws; this.room = null; this.seat = -1; this.name = ''; }
+    constructor(ws) {
+        this.ws = ws;
+        this.room = null;
+        this.seat = -1;
+        this.name = '';
+        this.userId = null;
+        this.profile = null;
+        this._authenticated = false;
+    }
+    get isAuthed() { return this._authenticated; }
     send(o) {
         if (this.ws.readyState !== WebSocket.OPEN) return;
         try { this.ws.send(JSON.stringify(o)); } catch (_) { }
@@ -932,114 +973,254 @@ class Client {
 }
 
 const hub = new Hub();
-const wss = new WebSocket.Server({ port: PORT });
+const activeClients = new Map();
 
-wss.on('connection', (ws) => {
-    const client = new Client(ws);
-    ws.on('message', (raw) => {
-        let msg;
-        try { msg = JSON.parse(raw.toString()); } catch (_) { return; }
-        switch (msg.type) {
-            case 'list_rooms':
-                client.send({ type: 'rooms_list', rooms: hub.list() });
-                break;
+async function attachProfile(client, user) {
+    const userId = user._id.toString();
 
-            case 'create_room': {
-                const name = (msg.name || '').trim() || 'Table';
-                const pn = (msg.playerName || '').trim();
-                if (!pn) return client.send({ type: 'error', message: 'Name required' });
+    const existing = activeClients.get(userId);
+    if (existing && existing !== client) {
+        try {
+            existing.send({ type: 'auth_error', message: 'Signed in from another device' });
+            existing.ws.close(4000, 'Kicked');
+        } catch (_) { }
+        existing._authenticated = false;
+        activeClients.delete(userId);
+    }
 
-                const room = hub.create(name, pn, msg.config);
-                if (!room) return client.send({ type: 'error', message: 'Could not create room' });
+    client.userId = userId;
+    client.profile = db.publicProfile(user);
+    client.name = client.profile.displayName;
+    client._authenticated = true;
+    activeClients.set(userId, client);
 
-                client.room = room;
-                client.seat = 0;
-                client.name = pn;
-                room.clients.push(client);
-                client.send({ type: 'joined', room: room.name, roomId: room.id, seat: 0 });
-                room.broadcastLobby();
-                break;
-            }
+    const token = signToken(userId);
+    client.send({ type: 'auth_ok', token, profile: client.profile });
+}
 
-            case 'join_room': {
-                const roomId = (msg.roomId || '').trim().toUpperCase();
-                const pn = (msg.playerName || '').trim();
-                if (!pn) return client.send({ type: 'error', message: 'Name required' });
-                if (!roomId) return client.send({ type: 'error', message: 'Room ID required' });
+async function handleSignup(client, msg) {
+    try {
+        const result = await db.signup(msg.username, msg.password, msg.displayName);
+        if (result.error) {
+            client.send({ type: 'auth_error', message: result.error });
+            return;
+        }
+        await attachProfile(client, result.user);
+    } catch (e) {
+        console.error('[auth] signup failed:', e);
+        client.send({ type: 'auth_error', message: 'server-error' });
+    }
+}
 
-                const room = hub.get(roomId);
-                if (!room) return client.send({ type: 'error', message: 'Room not found' });
-                if (room.phase !== 'lobby') return client.send({ type: 'error', message: 'Already started' });
-                if (room.isFull()) return client.send({ type: 'error', message: 'Full' });
-                if (room.clients.some((c) => c.name === pn))
-                    return client.send({ type: 'error', message: 'Name taken' });
+async function handleLogin(client, msg) {
+    try {
+        const result = await db.login(msg.username, msg.password);
+        if (result.error) {
+            client.send({ type: 'auth_error', message: result.error });
+            return;
+        }
+        await attachProfile(client, result.user);
+    } catch (e) {
+        console.error('[auth] login failed:', e);
+        client.send({ type: 'auth_error', message: 'server-error' });
+    }
+}
 
-                const seat = room.clients.length;
-                client.room = room;
-                client.seat = seat;
-                client.name = pn;
-                room.clients.push(client);
-                client.send({ type: 'joined', room: room.name, roomId: room.id, seat });
-                room.broadcastLobby();
-                break;
-            }
+async function handleResume(client, msg) {
+    try {
+        const userId = verifyToken(msg.token);
+        if (!userId) {
+            client.send({ type: 'auth_error', message: 'token-invalid' });
+            return;
+        }
+        const user = await db.findById(userId);
+        if (!user) {
+            client.send({ type: 'auth_error', message: 'user-not-found' });
+            return;
+        }
+        await attachProfile(client, user);
+    } catch (e) {
+        console.error('[auth] resume failed:', e);
+        client.send({ type: 'auth_error', message: 'server-error' });
+    }
+}
 
-            case 'start_game':
-                if (client.room) client.room.startGame(client);
-                break;
-
-            case 'leave_room': {
-                const room = client.room;
-                if (!room) return;
-                const rid = room.id;
-                room.removeClient(client);
-                client.room = null; client.seat = -1;
-                hub.removeIfEmpty(rid);
-                client.send({ type: 'left' });
-                break;
-            }
-
-            case 'rematch': {
-                const room = client.room;
-                if (!room) return;
-                room.phase = 'lobby';
-                room.scores = []; room.previousScores = []; room.foulsThisRound = [];
-                room.eliminated = []; room.hands = []; room.deck = []; room.discard = [];
-                room.melds = []; room._meldsId = 1;
-                room.firstMeldMade = false; room.initialMeldTarget = 0;
-                room.thresholdOwner = null; room.thresholdOwnerTotal = 0;
-                room.meldsThisTurn = []; room.coversThisTurnValue = 0;
-                room.currentRound = 1; room.currentSeat = 0; room.turnPhase = 'draw';
-                room.hasMeldedArr = []; room.bannedCovers = [];
-                room.lastDiscardAt = 0; room.lastDiscardSeat = -1;
-                room.lastDiscardSnatched = false; room.snatchedCards = [];
-                if (room._roundTimer) { clearTimeout(room._roundTimer); room._roundTimer = null; }
-                room.broadcastLobby();
-                break;
-            }
-
-            case 'action': {
-                const room = client.room;
-                if (!room) return;
-                const seat = room.clients.indexOf(client);
-                if (seat === -1) return;
-                room.handleAction(seat, msg.action, msg);
-                break;
+async function handleUpdateProfile(client, msg) {
+    if (typeof msg.displayName === 'string') {
+        const dn = msg.displayName.trim().slice(0, 20);
+        if (dn.length >= 1) {
+            const updated = await db.updateProfile(client.userId, { displayName: dn });
+            if (updated) {
+                client.profile = db.publicProfile(updated);
+                client.name = client.profile.displayName;
+                if (client.room) client.room.broadcastLobby();
+                client.send({ type: 'profile_updated', profile: client.profile });
             }
         }
-    });
-    ws.on('close', () => {
-        if (!client.room) return;
-        const rid = client.room.id;
-        client.room.removeClient(client);
-        hub.removeIfEmpty(rid);
-    });
-    ws.on('error', () => {
-        if (!client.room) return;
-        const rid = client.room.id;
-        client.room.removeClient(client);
-        hub.removeIfEmpty(rid);
-    });
-});
+    }
+}
 
-console.log(`Hareeg server on ws://0.0.0.0:${PORT}`);
+async function main() {
+    try {
+        await db.connect();
+    } catch (e) {
+        console.error('[startup] MongoDB Atlas connection failed:', e.message);
+        console.error('Fix MONGODB_URI in atlas-credentials.env and try again.');
+        process.exit(1);
+    }
+
+    const wss = new WebSocket.Server({ port: PORT });
+
+    wss.on('connection', (ws) => {
+        const client = new Client(ws);
+
+        ws.on('message', async (raw) => {
+            let msg;
+            try { msg = JSON.parse(raw.toString()); } catch (_) { return; }
+
+            if (!client.isAuthed) {
+                switch (msg.type) {
+                    case 'signup': return handleSignup(client, msg);
+                    case 'login': return handleLogin(client, msg);
+                    case 'resume': return handleResume(client, msg);
+                    default:
+                        client.send({ type: 'auth_error', message: 'Not authenticated' });
+                        return;
+                }
+            }
+
+            switch (msg.type) {
+                case 'list_rooms':
+                    client.send({ type: 'rooms_list', rooms: hub.list() });
+                    break;
+
+                case 'create_room': {
+                    const name = (msg.name || '').trim() || 'Table';
+                    const room = hub.create(name, client.name, msg.config);
+                    if (!room) return client.send({ type: 'error', message: 'Could not create room' });
+
+                    client.room = room;
+                    client.seat = 0;
+                    room.clients.push(client);
+                    client.send({ type: 'joined', room: room.name, roomId: room.id, seat: 0 });
+                    room.broadcastLobby();
+                    break;
+                }
+
+                case 'join_room': {
+                    const roomId = (msg.roomId || '').trim().toUpperCase();
+                    if (!roomId) return client.send({ type: 'error', message: 'Room ID required' });
+
+                    const room = hub.get(roomId);
+                    if (!room) return client.send({ type: 'error', message: 'Room not found' });
+                    if (room.phase !== 'lobby') return client.send({ type: 'error', message: 'Already started' });
+                    if (room.isFull()) return client.send({ type: 'error', message: 'Full' });
+                    if (room.clients.some((c) => c.name === client.name))
+                        return client.send({ type: 'error', message: 'Name taken' });
+
+                    const seat = room.clients.length;
+                    client.room = room;
+                    client.seat = seat;
+                    room.clients.push(client);
+                    client.send({ type: 'joined', room: room.name, roomId: room.id, seat });
+                    room.broadcastLobby();
+                    break;
+                }
+
+                case 'start_game':
+                    if (client.room) client.room.startGame(client);
+                    break;
+
+                case 'leave_room': {
+                    const room = client.room;
+                    if (!room) return;
+                    const rid = room.id;
+                    room.removeClient(client);
+                    client.room = null; client.seat = -1;
+                    hub.removeIfEmpty(rid);
+                    client.send({ type: 'left' });
+                    break;
+                }
+
+                case 'rematch': {
+                    const room = client.room;
+                    if (!room) return;
+                    room.phase = 'lobby';
+                    room.scores = []; room.previousScores = []; room.foulsThisRound = [];
+                    room.eliminated = []; room.hands = []; room.deck = []; room.discard = [];
+                    room.melds = []; room._meldsId = 1;
+                    room.firstMeldMade = false; room.initialMeldTarget = 0;
+                    room.thresholdOwner = null; room.thresholdOwnerTotal = 0;
+                    room.meldsThisTurn = []; room.coversThisTurnValue = 0;
+                    room.currentRound = 1; room.currentSeat = 0; room.turnPhase = 'draw';
+                    room.hasMeldedArr = []; room.bannedCovers = [];
+                    room.lastDiscardAt = 0; room.lastDiscardSeat = -1;
+                    room.lastDiscardSnatched = false; room.snatchedCards = [];
+                    room.snatchRetries = [];
+                    if (room._roundTimer) { clearTimeout(room._roundTimer); room._roundTimer = null; }
+                    room.broadcastLobby();
+                    break;
+                }
+
+                case 'action': {
+                    const room = client.room;
+                    if (!room) return;
+                    const seat = room.clients.indexOf(client);
+                    if (seat === -1) return;
+                    room.handleAction(seat, msg.action, msg);
+                    break;
+                }
+
+                case 'update_profile':
+                    return handleUpdateProfile(client, msg);
+
+                case 'logout': {
+                    const room = client.room;
+                    if (room) {
+                        const rid = room.id;
+                        room.removeClient(client);
+                        client.room = null;
+                        hub.removeIfEmpty(rid);
+                    }
+                    if (client.userId) activeClients.delete(client.userId);
+                    client.userId = null;
+                    client.profile = null;
+                    client._authenticated = false;
+                    client.name = '';
+                    client.send({ type: 'logged_out' });
+                    break;
+                }
+            }
+        });
+
+        ws.on('close', () => {
+            if (client.userId) {
+                const existing = activeClients.get(client.userId);
+                if (existing === client) activeClients.delete(client.userId);
+            }
+            if (!client.room) return;
+            const rid = client.room.id;
+            client.room.removeClient(client);
+            hub.removeIfEmpty(rid);
+        });
+
+        ws.on('error', () => {
+            if (client.userId) {
+                const existing = activeClients.get(client.userId);
+                if (existing === client) activeClients.delete(client.userId);
+            }
+            if (!client.room) return;
+            const rid = client.room.id;
+            client.room.removeClient(client);
+            hub.removeIfEmpty(rid);
+        });
+    });
+
+    console.log(`Hareeg server on ws://0.0.0.0:${PORT}`);
+    console.log(`Ready for connections with MongoDB Atlas persistence.`);
+}
+
+main().catch((e) => {
+    console.error('[fatal]', e);
+    process.exit(1);
+});
